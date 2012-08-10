@@ -226,7 +226,6 @@ if ($opts{date}){
 }
 
 # Allow comma separated multi-argument
-@vms = split(/,/,join(',',@vms));
 @excludes = split(/,/,join(',',@excludes));
 
 # Backward compatible with --dump --cleanup --unlock
@@ -250,6 +249,22 @@ if (! -d $opts{backupdir} ){
 print "\n\nConnecting to libvirt daemon using $opts{connect} as URI\n" if ($opts{debug});
 our $libvirt = Sys::Virt->new( uri => $opts{connect} ) ||
     die "Error connecting to libvirt on URI: $opts{connect}";
+
+if ("@vms" eq "backup_all") {
+    ##
+    # API: http://search.cpan.org/dist/Sys-Virt/lib/Sys/Virt.pm
+    # merge list_defined_domains() and list_domains() to obtain full domain list
+    # list_all_domains() don't exist on my system
+    ##
+    @domains_object = ($libvirt->list_defined_domains(), $libvirt->list_domains());
+    @vms = ();
+    foreach my $object (@domains_object) {
+        push(@vms, $object->get_name());
+    }
+}
+else {
+    @vms = split(/,/,join(',',@vms));
+}
 
 print "\n" if ($opts{debug});
 
@@ -524,7 +539,7 @@ sub usage{
     "\t\t- chunkmount: Mount each device as a chunkfs mount point directly in the backup dir\n" .
     "\t\t- unlock: just remove the lock file, but don't cleanup the backup dir\n\n" .
     "\t--vm=name: The VM you want to work on (as known by libvirt). You can backup several VMs in one shot " .
-        "if you separate them with comma, or with multiple --vm argument. You have to use the name of the domain, ".
+        "if you separate them with comma, or with multiple --vm argument. Use backup_all argument if you want to backup all your VM. You have to use the name of the domain, ".
         "ID and UUID are not supported at the moment\n\n" .
     "\n\nOther options:\n\n" .
     "\t--state: Cleaner way to take backups. If this flag is present, the script will save the current state of " .
