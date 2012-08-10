@@ -306,6 +306,7 @@ foreach our $vm (@vms){
 ############################################################################
 
 sub prepare_backup{
+    @disks = ();
     # Create a new XML object
     my $xml = new XML::Simple ();
     my $data = $xml->XMLin( $dom->get_xml_description(), forcearray => ['disk'] );
