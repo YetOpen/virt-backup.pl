@@ -85,9 +85,6 @@
 # the chunkfs mount points
 
 
-
-
-
 ### TODO:
 # - If all the disks cannot be snapshoted, the VM should be locked so it cannot be accidentally started
 #   during a backup
