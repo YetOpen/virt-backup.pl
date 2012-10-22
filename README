@@ -1,8 +1,7 @@
 Copied from http://repo.firewall-services.com/misc/virt/virt-backup.pl
 This version on https://github.com/ljunkie/virt-backup.pl
 
-* adding the ability to cleanup backup directories with option to keep X number of backups.
-  instead of just removing all backups.
+* adding the ability to cleanup backup directories with option to keep X number of backups, instead of just removing all backups.
 
 # AUTHOR
 #   Daniel Berteaud <daniel@firewall-services.com>
