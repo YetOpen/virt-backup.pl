@@ -111,6 +111,10 @@ use XML::Simple;
 use Sys::Virt;
 use Getopt::Long;
 use File::Which qw(which);
+use Path::Class;
+use Number::Bytes::Human;
+use Data::Dumper;
+#use strict;
 
 # Set umask
 umask(022);
@@ -179,7 +183,10 @@ GetOptions(
     "compress:s"   => \$opts{compress},
     "exclude=s"    => \@excludes,
     "blocksize=s" => \$opts{blocksize},
-    "help"         => \$opts{help}
+    "help"         => \$opts{help},
+    "cleanup_keep" => \$opts{cleanup_keep},
+    "keep=s" => \$opts{keep},
+    "debug_ck" => \$opts{debug_ck},
 );
 
 
@@ -225,31 +232,7 @@ if ($opts{date}){
     chomp $date;
 }
 
-# Allow comma separated multi-argument
-@excludes = split(/,/,join(',',@excludes));
-
-# Backward compatible with --dump --cleanup --unlock
-$opts{action} = 'dump' if ($opts{dump});
-$opts{action} = 'cleanup' if ($opts{cleanup});
-$opts{action} = 'unlock' if ($opts{unlock});
-
-# Stop here if we have no vm
-# Or the help flag is present
-if ((!@vms) || ($opts{help})){
-    usage();
-    exit 1;
-}
-
-if (! -d $opts{backupdir} ){
-    print "$opts{backupdir} is not a valid directory\n";
-    exit 1;
-}
-
-# Connect to libvirt
-print "\n\nConnecting to libvirt daemon using $opts{connect} as URI\n" if ($opts{debug});
-our $libvirt = Sys::Virt->new( uri => $opts{connect} ) ||
-    die "Error connecting to libvirt on URI: $opts{connect}";
-
+# Allow comma separated multi-argument - or - backups_all
 if ("@vms" eq "backup_all") {
     ##
     # API: http://search.cpan.org/dist/Sys-Virt/lib/Sys/Virt.pm
@@ -265,8 +248,42 @@ if ("@vms" eq "backup_all") {
 else {
     @vms = split(/,/,join(',',@vms));
 }
+@excludes = split(/,/,join(',',@excludes));
+
+# Backward compatible with --dump --cleanup --unlock
+$opts{action} = 'dump' if ($opts{dump});
+$opts{action} = 'cleanup' if ($opts{cleanup});
+$opts{action} = 'unlock' if ($opts{unlock});
+
+# Stop here if we have no vm -- continue if cleanup_keep is specified. Doesn't need to VM, just a backup dir
+# Or the help flag is present
+if ( ( !@vms || $opts{help} ) && ($opts{action} ne 'cleanup_keep') ) {
+    usage();
+    exit 1;
+}
+
+if (! -d $opts{backupdir} ){
+    print "$opts{backupdir} is not a valid directory\n";
+    exit 1;
+}
+
+# Connect to libvirt
+print "\n\nConnecting to libvirt daemon using $opts{connect} as URI\n" if ($opts{debug});
+our $libvirt = Sys::Virt->new( uri => $opts{connect} ) ||
+    die "Error connecting to libvirt on URI: $opts{connect}";
 
 print "\n" if ($opts{debug});
+
+
+
+if ( !@vms && $opts{action} eq 'cleanup_keep') {
+    print "Running GLOBAL cleanup routine in $opts{backupdir} (keep mode)\n\n" if ($opts{debug});
+    run_cleanup_keep();
+    exit;
+}
+
+
+
 
 foreach our $vm (@vms){
     # Create a new object representing the VM
@@ -278,6 +295,10 @@ foreach our $vm (@vms){
         print "Running cleanup routine for $vm\n\n" if ($opts{debug});
         run_cleanup();
     }
+    if ($opts{action} eq 'cleanup_keep'){
+        print "Running cleanup routine for $vm (keep mode)\n\n" if ($opts{debug});
+        run_cleanup_keep();
+    }
     elsif ($opts{action} eq 'unlock'){
         print "Unlocking $vm\n\n" if ($opts{debug});
         unlock_vm();
@@ -287,6 +308,7 @@ foreach our $vm (@vms){
         mkdir $backupdir || die $!;
         mkdir $backupdir . '.meta' || die $!;
         run_dump();
+	run_cleanup_keep() if ($opts{cleanup_keep});
     }
     elsif ($opts{action} eq 'chunkmount'){
         print "Running chunkmount routine for $vm\n\n" if ($opts{debug});
@@ -529,19 +551,212 @@ sub run_cleanup{
 }
 
 
+
+# Remove the dumps
+sub run_cleanup_keep{
+    my $debug = $opts{debug_ck}; ## wanted debug to not do anything, the normal debug still executes - this debug will not execute system calls
+    
+    if ($backupdir) {
+	print "Specific VM cleanup $backupdir\n" if ($opts{debug});
+    } else {
+	$backupdir =  $opts{backupdir}; ## global cleanup.
+	print "Gloabl cleanup: $backupdir\n" if ($opts{debug});
+    }
+    
+    print "\n *** DEBUG_ck MODE -- * DRY-RUN *\n" if $debug;
+    
+    
+    my $keep = 1; # default to 1 kept unless specified
+    $keep =  $opts{keep}  if ($opts{keep});
+
+    my $kvm_dir = $backupdir;
+    my $min_size = .2*(1024*1024*1024); ## mininum file size to count towards successful backup (500MB default)
+    ## if this number is TOO high, it will never remove old backups
+    ## remember if you compress your virts snapshot, they may be small since it really only counts used space
+    
+    my $clean_empty = '1'; ## will remove zero byte backups
+    my $rsync = 0;         ## disabled by default - enable if you understand this options. I have an odd setup, so I use it.
+    my $rsync_to = '/KVMbackups/virt-backup/'; ## make sure this is it's OWN directory. rsync --delete flag is used
+    my $rsync_opts = ' --delete --human-readable ';
+    
+    print "\n KVM Backup Cleanup: $kvm_dir -- Allowed $keep backup(s) per HOST\n\n" if ($opts{debug});
+    
+    
+    ##########################################################################################
+    my $human = Number::Bytes::Human->new();
+    my $hsize_min = $human->format($min_size);
+    my $backups = ();
+    my $dir = dir($kvm_dir);
+    my $c = 0;
+    $dir->traverse(sub{
+	my ($child, $cont, $indent) = @_;
+	if (!$child->is_dir && $child =~ /.*\.img/) {
+	    my $img_dir = $child->dir->stringify;
+	    
+	    my $time = $child->stat()->[8];
+	    my $size = $child->stat()->[7];
+	    $backups->{$img_dir}->{$time}->{'name'} = $child->stringify;
+	    $backups->{$img_dir}->{$time}->{'dir'} = $child->dir->stringify;
+	    $backups->{$img_dir}->{$time}->{'size'} = $size;
+	    $backups->{$img_dir}->{$time}->{'time'} = $time;
+	}
+	$cont->($c + 1);
+		   }
+	);
+    
+    
+    my $output;
+    my $inprogress;
+    my $inprogress_rsync;
+    my $keep_orig = $keep;
+    my @rsync;
+    my $kept = ();
+    
+    foreach my $d (keys %{$backups}) {
+	$keep = $keep_orig;
+	my @path = split("\/",$d);
+	my $host = pop(@path);
+	
+	my $meta_dir = $d . ".meta";
+	my $lock_file = $meta_dir . "/$host.lock";
+	if (-f $lock_file) {
+	    $keep++;
+	    $inprogress .= "$host ($lock_file found) -- Allowed backups for host changed from $keep_orig to $keep\n";
+	    $inprogress_rsync .= "$host ($lock_file found)";
+	}  else {
+	    if ($rsync) {	    push (@rsync,$d);}
+	    if (!$debug) {
+		my $meta = unlink <$meta_dir/*>;
+		rmdir "$meta_dir";
+	    }
+	}
+	
+	my $total_backups = scalar keys $backups->{$d};
+	my %hash = %{$backups->{$d}};
+	   
+	
+	if ($total_backups > $keep) {
+	    
+	    print "\n\t--------------------------------------- Cleaning: " . $d . " Backup(s): $total_backups found (allowed $keep)---------------------------------------\n\n" if ($opts{debug});
+	    for (my $count = 1; $count <= $keep; $count++) {
+		next if $count > $total_backups; ## we don't have any more backups to test
+		
+		my $size =  $hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'size'};
+		my $hsize = $human->format($size);
+		my $name = $hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'name'};
+		my $htime = localtime($hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'time'});
+		my $time = $hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'time'};
+		
+		
+
+		if ($size < $min_size) {
+		    print "\tSkip Backup: [$hsize] [$htime] $name [Backup FileSize < Mininum: $hsize_min] --> trying next backup\n" if ($opts{debug});
+		    if ($size == 0 && $clean_empty) {
+			print "\t$hsize bytes: REMOVING backup\n\n" if ($opts{debug});
+			if (!$debug) { unlink($name); }
+		    }
+		    $keep++; ## try to keep another one
+		} else {
+		    ## just for display
+		    print "\tKeep Backup: [$hsize] [$htime] $name [Number: $count]\n" if ($opts{debug});
+		    if (!defined($kept->{$host}->{'time'}) || $kept->{$host}->{'time'} < $time) {
+			$kept->{$host}->{'time'} = $time;
+			$kept->{$host}->{'htime'} = $htime;
+			$kept->{$host}->{'name'} = $name; 
+			$kept->{$host}->{'htime'} = $htime; 
+			$kept->{$host}->{'htime'} = $htime; 
+			$kept->{$host}->{'hsize'} = $hsize; 
+		    }
+		    $kept->{$host}->{'count'}++; 
+		}
+		delete $hash{(sort  {$b<=>$a}  keys %hash)[0]}; ## remove from hash, to skip deletion
+	    }
+	    print "\n" if ($opts{debug});
+	    
+	    
+	    foreach my $k (sort {$a<=>$b} keys %hash) {
+		my $file = $hash{$k};
+		my $size =  $file->{'size'};
+		my $hsize = $human->format($size);
+		my $name = $file->{'name'};
+		my $htime = localtime($file->{'time'});
+		print "\tDel  Backup: [$hsize] [$htime] $name\n" if ($opts{debug});
+		if (!$debug) { unlink($name); }
+	    }
+
+	    print "\t---------------------------------------------------------------------------------------------------------------------------------------------------\n\n" if ($opts{debug});
+	} else {
+	    print "\n\t--------------------------------------- OK: " . $d . " Backup(s): $total_backups found (allowed $keep)---------------------------------------\n\n" if ($opts{debug});
+	    my $size =  $hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'size'};
+	    my $hsize = $human->format($size);
+	    my $name = $hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'name'};
+	    my $htime = localtime($hash{(sort  {$b<=>$a}  keys %hash)[0]}->{'time'});
+	    $output .= sprintf(" %-15s %-10s %-12s %-30s %-30s\n", $host, $total_backups, $hsize, $htime, $name);
+	    
+	}
+    }
+    
+    foreach my $k (keys %{$kept}) {
+	$output .= sprintf(" %-15s %-10s %-12s %-30s %-30s\n", $k, $kept->{$k}->{'count'}, $kept->{$k}->{'hsize'}, $kept->{$k}->{'htime'}, $kept->{$k}->{'name'});
+    }
+    #if ($output .= sprintf(" %-15s %-10s %-12s %-30s %-30s\n", $host, $total_backups, $hsize, $htime, $name);
+
+    if ($inprogress) {
+	print "\n\t--------------------------------------- Backups In Progress ----------------------------------------------------------------------------------------\n\n" if ($opts{debug});
+	print "\t$inprogress" if ($opts{debug});
+	print "\n\t----------------------------------------------------------------------------------------------------------------------------------------------------\n\n" if ($opts{debug});
+    }
+    
+    my $htime =  localtime(time());
+    print " $htime \n" if ($opts{debug});
+    printf(" %-15s %-10s %-12s %-30s %-30s\n", 'host', 'backups', 'last size', 'last backup', 'file location') if ($opts{debug});
+    printf(" %-15s %-10s %-12s %-30s %-30s\n", '----', '-------', '---------', '-----------', '-------------') if ($opts{debug});
+    
+    print $output. "\n" if ($opts{debug});
+    
+    if ($rsync && @rsync) {
+	print "\n\t--------------------------------------- RSYNC backups to $rsync_to ----------------------------------------------------------------------------------------\n\n" if ($opts{debug});
+	if ($rsync_to !~ /\w+\/\w.*/) {
+	    print "\tNOT rsyncing to '$rsync_to' -- too close to root (not safe with --delete flag) \n\n" if ($opts{debug});
+	    exit;
+	}
+	foreach my $src (@rsync) {
+	    if (-d $src && -d $rsync_to) {
+		print "\n\t** rsync -aP $rsync_opts $src $rsync_to\n" if ($opts{debug});
+		if (!$debug) {	    system("rsync -aP $rsync_opts  $src $rsync_to"); }
+	    } else {
+		print "\tCannot rsync, src $src or dst $rsync_to does not exist\n" if ($opts{debug});
+	    }
+	}
+	if ($inprogress_rsync) {
+	    print "\n\t*Skipping inprogess VIRTS from RSYNC\n" if ($opts{debug});
+	    print "\t$inprogress_rsync\n" if ($opts{debug});
+	}
+	print "\n\t-----------------------------------------------------------------------------------------------------------------------------------------------------------\n\n" if ($opts{debug});
+    }
+
+}
+
+
 sub usage{
     print "usage:\n$0 --action=[dump|cleanup|chunkmount|unlock] --vm=vm1[,vm2,vm3] [--debug] [--exclude=hda,hdb] [--compress] ".
         "[--state] [--no-snapshot] [--snapsize=<size>] [--backupdir=/path/to/dir] [--connect=<URI>] ".
-        "[--keep-lock] [--bs=<block size>]\n" .
+        "[--keep-lock] [--bs=<block size>] [--cleanup_keep --keep=<number>]\n" .
     "\n\n" .
-    "\t--action: What action the script will run. Valid actions are\n\n" .
-    "\t\t- dump: Run the dump routine (dump disk image to temp dir, pausing the VM if needed). It's the default action\n" .
-    "\t\t- cleanup: Run the cleanup routine, cleaning up the backup dir\n" .
-    "\t\t- chunkmount: Mount each device as a chunkfs mount point directly in the backup dir\n" .
-    "\t\t- unlock: just remove the lock file, but don't cleanup the backup dir\n\n" .
-    "\t--vm=name: The VM you want to work on (as known by libvirt). You can backup several VMs in one shot " .
-        "if you separate them with comma, or with multiple --vm argument. Use backup_all argument if you want to backup all your VM. You have to use the name of the domain, ".
-        "ID and UUID are not supported at the moment\n\n" .
+    "\t--action:         What action the script will run. Valid actions are\n\n" .
+    "\t\t- dump:         Run the dump routine (dump disk image to temp dir, pausing the VM if needed). It's the default action\n" .
+    "\t\t- cleanup:      Run the cleanup routine, cleaning up the backup dir\n" .
+    "\t\t- cleanup_keep: Run the cleanup routine, cleaning up the backup dir\n" .
+    "\t\t- chunkmount:   Mount each device as a chunkfs mount point directly in the backup dir\n" .
+    "\t\t- unlock:       just remove the lock file, but don't cleanup the backup dir\n\n" .
+    "\t--vm=name: The VM you want to work on (as known by libvirt). " .
+    "\n\t\t\tYou can backup several VMs in one shot if you separate them with comma, or with multiple --vm argument. ".
+    "\n\t\t\tYou have to use the name of the domain, ID and UUID are not supported at the moment\n\n" .
+    "\t--cleanup_keep: This will clean the backup directories and keep at least 1 backup per VM. (do not use --cleanup) " .
+    "\n\t\t\tAppend --keep=<number> to keep more than 1. I.E. --cleanup_keep --keep=4 (to keep 4 backups)".
+    "\n\t\t\t*This option must be used with --action=dump - It will clean the backup directory after the dump\n\n".
+    "\n\t\t\t* To run it without dump (use --action=cleanup_keep )\n\n".
+
     "\n\nOther options:\n\n" .
     "\t--state: Cleaner way to take backups. If this flag is present, the script will save the current state of " .
         "the VM (if running) instead of just suspending it. With this you should be able to restore the VM at " .
@@ -568,7 +783,7 @@ sub usage{
         "The default is qemu:///system.\n\n" .
     "\t--date: Add date and time to filename.\n\n" .
     "\t--keep-lock: Let the lock file present. This prevent another " .
-        "dump to run while an third party backup software (BackupPC for example) saves the dumped files.\n\n";
+    "dump to run while an third party backup software (BackupPC for example) saves the dumped files.\n\n";
 }
 
 # Save a running VM, if it's running
